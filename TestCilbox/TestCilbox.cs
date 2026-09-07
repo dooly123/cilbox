@@ -294,6 +294,30 @@ namespace TestCilbox
 			proxy.GetType().GetMethod(methodName, BindingFlags.Instance | BindingFlags.NonPublic, Type.EmptyTypes).Invoke(proxy, new object[0]);
 		}
 
+		private static void InvokeProxyCallback(Cilbox.CilboxProxy proxy, string name)
+		{
+			proxy.GetType().GetMethod( name, BindingFlags.Instance|BindingFlags.NonPublic, Type.EmptyTypes ).Invoke( proxy, new object[0] );
+		}
+
+		// Runs a proxy callback and reports whether an interpreter timeout escaped to the caller.
+		private static bool InvokeProxyCallbackTimedOut(Cilbox.CilboxProxy proxy, string name)
+		{
+			try
+			{
+				InvokeProxyCallback( proxy, name );
+				return false;
+			}
+			catch( TargetInvocationException e )
+			{
+				if (e.InnerException is not CilboxInterpreterTimeoutException)
+				{
+					throw;
+				}
+				Debug.Log( e.ToString().Length.ToString() );
+				return true;
+			}
+		}
+
 		private static object GetProxyFieldObject(Cilbox.CilboxProxy proxy, string fieldName)
 		{
 			for( int i = 0; i < proxy.cls.instanceFieldNames.Length; i++ )
@@ -500,32 +524,74 @@ namespace TestCilbox
 				Validator.Validate( e.ToString(), "Should be no error." );
 			}
 
-			try
+			// RunPerfSuite below is sensitive to how much interpreted code ran before it: adding the
+			// coverage below ahead of it moved TrigUs by about 50% on this machine, which would make
+			// version-to-version perf comparisons meaningless. So while measuring, only the halt is
+			// exercised, and a strike limit of one keeps that to the single overrun it always was.
+			if( runPerf )
 			{
-				// Ensure 50ms timeout for the Update test.
+				cb.timeoutStrikeLimit = 1;
+			}
+			else
+			{
+				// The budget covers one call. Five calls that each cost a third of it must all
+				// complete; while the budget was cumulative this timed out on the third one.
+				cb.timeoutLengthUs = 60000; // 60ms, against ~20ms of work per call
+				bool partialBudgetTimedOut = false;
+				for( int i = 0; i < 5 && !partialBudgetTimedOut; i++ )
+					partialBudgetTimedOut = InvokeProxyCallbackTimedOut( proxy, "OnEnable" );
+				Validator.Set( "Partial Budget Timed Out", partialBudgetTimedOut.ToString() );
+				Validator.Validate( "Partial Budget Timed Out", "False" );
+				Validator.ValidateCount( "Partial Budget Call", 5 );
+				Validator.Set( "Proxy Alive After Partial Budget", (!proxy.disabled).ToString() );
+				Validator.Validate( "Proxy Alive After Partial Budget", "True" );
+
 				cb.timeoutLengthUs = 50000; // 50ms
-				// In case assembly is still being generated.
-				proxy.GetType().GetMethod("Update",BindingFlags.Instance|BindingFlags.NonPublic,Type.EmptyTypes).Invoke( proxy, new object[0] );
-			} catch( TargetInvocationException e )
+
+				// One overrun aborts that call and is logged, and the script stays alive, so the
+				// next callback still runs.
+				Validator.Set( "First Overtime Escaped", InvokeProxyCallbackTimedOut( proxy, "Update" ).ToString() );
+				Validator.Validate( "First Overtime Escaped", "False" );
+				Validator.Set( "Proxy Alive After One Timeout", (!proxy.disabled).ToString() );
+				Validator.Validate( "Proxy Alive After One Timeout", "True" );
+
+				Validator.Set( "Execution after timeout", "disabled" );
+				InvokeProxyCallback( proxy, "FixedUpdate" );
+				Validator.Validate( "Execution after timeout", "enabled" );
+
+				// Strikes expire: overruns spaced further apart than the window never add up.
+				cb.timeoutStrikeWindowSeconds = 0.02f;
+				InvokeProxyCallbackTimedOut( proxy, "Update" );
+				Thread.Sleep( 40 );
+				InvokeProxyCallbackTimedOut( proxy, "Update" );
+				Validator.Set( "Proxy Alive Across Strike Window", (!proxy.disabled).ToString() );
+				Validator.Validate( "Proxy Alive Across Strike Window", "True" );
+				cb.timeoutStrikeWindowSeconds = 10f;
+			}
+
+			// Ensure 50ms timeout for the Update test.
+			cb.timeoutLengthUs = 50000; // 50ms
+
+			// timeoutStrikeLimit overruns inside the window halt the script, and that one throws, so
+			// a host that wants to know about a runaway script still finds out.
+			Validator.Set( "Overtime Exception", "Not Thrown" );
+			for( int i = 0; i < cb.timeoutStrikeLimit; i++ )
 			{
-				if (e.InnerException is not CilboxInterpreterTimeoutException)
-				{
-					throw;
-				}
-				Debug.Log( e.ToString().Length.ToString() );
+				if( !InvokeProxyCallbackTimedOut( proxy, "Update" ) ) continue;
 				Validator.Set( "Overtime Exception", "Thrown" );
+				break;
 			}
 			Validator.Validate( "Overtime Exception", "Thrown" );
 			Validator.Validate( "Overtime", "timed out" );
 			Validator.Validate( "Update", "called" );
 
 			Validator.Set( "Execution after timeout", "disabled" );
-			proxy.GetType().GetMethod("FixedUpdate",BindingFlags.Instance|BindingFlags.NonPublic,Type.EmptyTypes).Invoke( proxy, new object[0] );
+			InvokeProxyCallback( proxy, "FixedUpdate" );
 			Validator.Validate( "Execution after timeout", "disabled" );
 
 			Validator.Set( "Proxy Disabled After Timeout", proxy.disabled.ToString() );
 			cb.disabled = false;
-			proxy.GetType().GetMethod("FixedUpdate",BindingFlags.Instance|BindingFlags.NonPublic,Type.EmptyTypes).Invoke( proxy, new object[0] );
+			InvokeProxyCallback( proxy, "FixedUpdate" );
 
 			cb.timeoutLengthUs = 3000000; // should be over max
 			Validator.Set("Real timeoutLengthUs", cb.timeoutLengthUs.ToString() );

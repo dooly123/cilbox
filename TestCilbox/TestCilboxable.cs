@@ -824,6 +824,20 @@ namespace TestCilbox
 			Validator.Set( "FixedUpdate", "called" );
 		}
 
+		// Costs a fraction of the budget the caller sets, so calling it repeatedly only times out
+		// if the accounting carries time from one call into the next.
+		public void OnEnable()
+		{
+			System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+			double result = 1.3;
+			while( sw.ElapsedMilliseconds < 20 )
+			{
+				for( int i = 0; i < 2000; i++ ) result = System.Math.Sin( result ) * 10.0;
+			}
+			Validator.AddCount( "Partial Budget Call" );
+			Validator.Set( "Partial Budget Result", result.ToString() );
+		}
+
 		public void ReadInt(ref int field)
 		{
 			int current = field;
