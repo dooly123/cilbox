@@ -27,6 +27,8 @@ namespace Cilbox
 		private bool proxyLoadInProgress = false;
 
 		public bool disabled = false;
+		[System.NonSerialized] public int timeoutStrikes = 0;
+		[System.NonSerialized] public long lastTimeoutTicks = 0;
 
 		public void DisableProxy()
 		{

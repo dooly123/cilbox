@@ -172,20 +172,29 @@ namespace Cilbox
 			}
 
 			object ret = null;
-			if( !parentClass.box.InterpreterEntry(this) ) return null;
+			Cilbox box = parentClass.box;
+			if( !box.InterpreterEntry(this) ) return null;
 			try
 			{
 				ret = InterpretInner( stackBuffer, parameters ).AsObject();
 			}
 			catch( Exception e )
 			{
-				parentClass.box.InterpreterExit();
+				box.InterpreterExit();
+				// A timeout that surfaced inside a native callback arrives wrapped as the script's unhandled throw.
+				Exception cause = e is CilboxUnhandledInterpretedException wrapped && wrapped.Throwee is Exception inner ? inner : e;
+				if( cause is CilboxInterpreterTimeoutException timeout )
+				{
+					// Unwind to the outermost call of this entry; only that one applies the strike policy.
+					if( Cilbox.threadEntryDepth > 0 ) throw;
+					if( !box.RecordTimeout( ths, timeout ) ) return null;
+				}
 				if( ths != null ) ths.DisableProxy();
-				else parentClass.box.DisableWithReason(e.ToString());
+				else box.DisableWithReason(e.ToString());
 				if( e is CilboxUnhandledInterpretedException uhe && uhe.Throwee is System.Exception te ) throw te;
 				throw;
 			}
-			parentClass.box.InterpreterExit();
+			box.InterpreterExit();
 
 			return ret;
 		}
@@ -201,6 +210,9 @@ namespace Cilbox
 #endif
 
 			Cilbox box = parentClass.box;
+			// The deadline is fixed for the whole call tree, so read the thread-static once here
+			// rather than on every clock check.
+			long dropDead = Cilbox.threadDropDead;
 
 			int localVarsHead = MaxStackSize;
 			int stackContinues = localVarsHead + methodLocals.Length;
@@ -226,20 +238,16 @@ namespace Cilbox
 			{
 				do
 				{
-					// While this is not threadsafe, that's OK.  This is more for broad strokes.
-					// We don't have to worry about critical pieces going in/out of a race condition
-					// for instance, interpreterAccountingLastStart can't go wonky on us.
-					//
+					// The deadline is thread-local (see InterpreterEntry), so nothing here needs interlocking.
 					// If you use Interlocked.Add() it slows the whole emulator down by about 40%!
 					long steps = ++box.interpreterInstructionsCount;
 					if( ( steps & 0x3f ) == 0 )
 					{
 						long now = System.Diagnostics.Stopwatch.GetTimestamp();
-						if( now > box.interpreterAccountingDropDead )
+						if( now > dropDead )
 						{
-							box.interpreterAccountingCumulitiveTicks = now + box.timeoutLengthUs * box.interpreterTicksInUs - box.interpreterAccountingDropDead;
 							cont = false;
-							throw new CilboxInterpreterTimeoutException( "Script time resources overutilized (Timeout Us: " + box.interpreterAccountingCumulitiveTicks / box.interpreterTicksInUs + "/" + box.timeoutLengthUs + " )", parentClass.className, methodName, pc);
+							throw new CilboxInterpreterTimeoutException( "Script time resources overutilized (" + ( now - Cilbox.threadEntryStart ) / box.interpreterTicksInUs + "us in one call, limit " + box.timeoutLengthUs + "us)", parentClass.className, methodName, pc);
 						}
 					}
 
@@ -1851,6 +1859,10 @@ spiperf.End();
 
 			void interpretedThrow(int currentInstruction, object thrownObj)
 			{
+				// A timeout is never the script's to catch. One that came back through a native call
+				// (a delegate handed to Array.Sort, say) unwinds the whole entry instead.
+				for( Exception walk = thrownObj as Exception; walk != null; walk = walk.InnerException )
+					if( walk is CilboxInterpreterTimeoutException ) throw walk;
 				sp = -1;
 				exceptionRegister = new StackElement() { type = StackType.Object, o = thrownObj };
 				if (!hasExceptionClauses)
@@ -2226,13 +2238,24 @@ spiperf.End();
 
 		public virtual long MaxTimeoutLengthUs => 1000000; // 1 second. Can be overridden by specific Cilbox application.
 
-		[HideInInspector] public uint interpreterAccountingDepth = 0;
-		[HideInInspector] public long interpreterAccountingDropDead = 0;
+		// Time accounting is per thread and per top-level call: every entry from native code gets the
+		// full timeoutLengthUs, nested interpreted calls on the same thread share the outer deadline,
+		// and calls on other threads get their own. Nothing here depends on Update() running.
+		[ThreadStatic] internal static uint threadEntryDepth;
+		[ThreadStatic] internal static long threadDropDead;
+		[ThreadStatic] internal static long threadEntryStart;
 		[HideInInspector] public long interpreterAccountingCumulitiveTicks = 0;
 		[HideInInspector] public long interpreterInstructionsCount = 0;
 		[HideInInspector] public long interpreterTicksInUs = System.Diagnostics.Stopwatch.Frequency / 1000000;
+		[HideInInspector] public int timeoutStrikes = 0;
+		[HideInInspector] public long lastTimeoutTicks = 0;
 
+		// Statistics only: interpreter time spent in the previous frame, summed over all scripts in this box.
 		public long usSpentLastFrame = 0;
+		// A timeout aborts the call that overran. The script is only halted when it keeps overrunning:
+		// timeoutStrikeLimit timeouts each within timeoutStrikeWindowSeconds of the previous one.
+		public int timeoutStrikeLimit = 3;
+		public float timeoutStrikeWindowSeconds = 10f;
 
 		public Cilbox()
 		{
@@ -2536,66 +2559,68 @@ spiperf.End();
 
 		public bool InterpreterEntry( CilboxMethod m )
 		{
-			// Use of Monitor.Lock's here slows the whole emulator down by about 8%
-			// TODO: Consider some sort of lockless approach.  This is tricky because
-			// you need to make sure you interlock both depth, and, time accounting.
-			long now = System.Diagnostics.Stopwatch.GetTimestamp();
-			Monitor.Enter( this );
-			if( ++interpreterAccountingDepth == 1 )
+			// Per-thread state, so the Monitor the old accounting needed is gone, and two threads can
+			// no longer corrupt each other's depth or deadline.
+			if( threadEntryDepth == 0 )
 			{
-				// First entry, if we've been disabled, quiety abort.
-				// this is normal if
-				if( disabled )
-				{
-					--interpreterAccountingDepth;
-					Monitor.Exit( this );
-					return false;
-				}
+				// First entry, if we've been disabled, quietly abort.
+				if( disabled ) return false;
+				long now = System.Diagnostics.Stopwatch.GetTimestamp();
+				threadEntryStart = now;
+				threadDropDead = now + timeoutLengthUs * interpreterTicksInUs;
 				interpreterInstructionsCount = 0;
-				interpreterAccountingDropDead = now + timeoutLengthUs * interpreterTicksInUs - interpreterAccountingCumulitiveTicks;
-				Monitor.Exit( this );
+				threadEntryDepth = 1;
 				return true;
 			}
-			else if( disabled )
+			if( disabled )
 			{
 				// fault from within, abort now.
-				Monitor.Exit( this );
 				throw new CilboxException( $"Function interpreation happened while box was disabled. This should not be possible. Offender: {m.parentClass.className} {m.fullSignature}" );
 			}
-			else
-			{
-				if( now > interpreterAccountingDropDead )
-				{
-					interpreterAccountingCumulitiveTicks = now + timeoutLengthUs * interpreterTicksInUs - interpreterAccountingDropDead;
-					--interpreterAccountingDepth;
-					Monitor.Exit( this );
-					throw new CilboxException( $"Function {m.parentClass.className} {m.fullSignature} timed out." );
-				}
+			if( System.Diagnostics.Stopwatch.GetTimestamp() > threadDropDead )
+				throw new CilboxInterpreterTimeoutException( $"Script time resources overutilized entering {m.parentClass.className} {m.fullSignature}", m.parentClass.className, m.methodName, 0 );
 
-				// Otherwise we are recursively being called. All is well.
-				Monitor.Exit( this );
-				return true;
-			}
+			// Otherwise we are recursively being called. All is well.
+			threadEntryDepth++;
+			return true;
 		}
 
 		public void InterpreterExit()
 		{
-			Monitor.Enter( this );
-			if( --interpreterAccountingDepth == 0 )
-			{
-				long now = System.Diagnostics.Stopwatch.GetTimestamp();
-				long elapsed = now + timeoutLengthUs * interpreterTicksInUs - interpreterAccountingDropDead - interpreterAccountingCumulitiveTicks;
-				interpreterAccountingCumulitiveTicks = now + timeoutLengthUs * interpreterTicksInUs - interpreterAccountingDropDead;
+			if( --threadEntryDepth != 0 ) return;
+			long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - threadEntryStart;
+			Interlocked.Add( ref interpreterAccountingCumulitiveTicks, elapsed );
 
-				// For profiling
-				if( showFunctionProfiling )
-				{
-					Monitor.Exit( this );
-					Debug.Log( $"{interpreterInstructionsCount} in {elapsed/10}us or {interpreterInstructionsCount*10.0/(double)elapsed}MHz" );
-					return;
-				}
+			// For profiling
+			if( showFunctionProfiling )
+			{
+				long us = elapsed / interpreterTicksInUs;
+				Debug.Log( $"{interpreterInstructionsCount} in {us}us or {( us > 0 ? interpreterInstructionsCount / (double)us : 0 )}MHz" );
 			}
-			Monitor.Exit( this );
+		}
+
+		// Returns true when the script should be halted. Strikes live on the proxy (per script instance),
+		// or on the box for static entries.
+		public bool RecordTimeout( CilboxProxy ths, CilboxInterpreterTimeoutException e )
+		{
+			long now = System.Diagnostics.Stopwatch.GetTimestamp();
+			long window = (long)( timeoutStrikeWindowSeconds * System.Diagnostics.Stopwatch.Frequency );
+			int strikes;
+			if( ths != null )
+			{
+				if( now - ths.lastTimeoutTicks > window ) ths.timeoutStrikes = 0;
+				ths.lastTimeoutTicks = now;
+				strikes = ++ths.timeoutStrikes;
+			}
+			else
+			{
+				if( now - lastTimeoutTicks > window ) timeoutStrikes = 0;
+				lastTimeoutTicks = now;
+				strikes = ++timeoutStrikes;
+			}
+			bool halt = strikes >= timeoutStrikeLimit;
+			Debug.LogWarning( e.Message + ( halt ? ": halting after " + strikes + " timeouts" : ": call aborted, strike " + strikes + "/" + timeoutStrikeLimit ) );
+			return halt;
 		}
 
 		void Update()
